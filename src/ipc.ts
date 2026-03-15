@@ -8,6 +8,12 @@ import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { isValidGroupFolder } from './group-folder.js';
 import { logger } from './logger.js';
+import {
+  cancelPipeline,
+  createPipeline,
+  pausePipeline,
+  resumePipeline,
+} from './pipelines.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -171,6 +177,10 @@ export async function processTaskIpc(
     trigger?: string;
     requiresTrigger?: boolean;
     containerConfig?: RegisteredGroup['containerConfig'];
+    // For pipeline operations
+    pipelineId?: string;
+    steps?: Array<{ name: string; prompt: string }>;
+    notify?: boolean;
   },
   sourceGroup: string, // Verified identity from IPC directory
   isMain: boolean, // Verified from directory path
@@ -412,6 +422,96 @@ export async function processTaskIpc(
           { sourceGroup },
           'Unauthorized refresh_groups attempt blocked',
         );
+      }
+      break;
+
+    case 'create_pipeline':
+      if (data.name && data.steps && data.steps.length > 0 && data.targetJid) {
+        const targetJid = data.targetJid;
+        const targetGroupEntry = registeredGroups[targetJid];
+        if (!targetGroupEntry) {
+          logger.warn(
+            { targetJid },
+            'Cannot create pipeline: target group not registered',
+          );
+          break;
+        }
+        if (!isMain && targetGroupEntry.folder !== sourceGroup) {
+          logger.warn(
+            { sourceGroup, targetFolder: targetGroupEntry.folder },
+            'Unauthorized create_pipeline attempt blocked',
+          );
+          break;
+        }
+        const contextMode =
+          data.context_mode === 'group' || data.context_mode === 'isolated'
+            ? data.context_mode
+            : 'isolated';
+        createPipeline({
+          name: data.name,
+          group_folder: targetGroupEntry.folder,
+          chat_jid: targetJid,
+          steps: data.steps,
+          context_mode: contextMode,
+          notify: data.notify,
+        });
+        logger.info(
+          { name: data.name, sourceGroup, stepCount: data.steps.length },
+          'Pipeline created via IPC',
+        );
+      } else {
+        logger.warn({ data }, 'Invalid create_pipeline request');
+      }
+      break;
+
+    case 'pause_pipeline':
+      if (data.pipelineId) {
+        const success = pausePipeline(sourceGroup, data.pipelineId);
+        if (success) {
+          logger.info(
+            { pipelineId: data.pipelineId, sourceGroup },
+            'Pipeline paused via IPC',
+          );
+        } else {
+          logger.warn(
+            { pipelineId: data.pipelineId, sourceGroup },
+            'Failed to pause pipeline (not found or not running)',
+          );
+        }
+      }
+      break;
+
+    case 'resume_pipeline':
+      if (data.pipelineId) {
+        const taskId = resumePipeline(sourceGroup, data.pipelineId);
+        if (taskId) {
+          logger.info(
+            { pipelineId: data.pipelineId, sourceGroup, taskId },
+            'Pipeline resumed via IPC',
+          );
+        } else {
+          logger.warn(
+            { pipelineId: data.pipelineId, sourceGroup },
+            'Failed to resume pipeline (not found or not paused)',
+          );
+        }
+      }
+      break;
+
+    case 'cancel_pipeline':
+      if (data.pipelineId) {
+        const success = cancelPipeline(sourceGroup, data.pipelineId);
+        if (success) {
+          logger.info(
+            { pipelineId: data.pipelineId, sourceGroup },
+            'Pipeline cancelled via IPC',
+          );
+        } else {
+          logger.warn(
+            { pipelineId: data.pipelineId, sourceGroup },
+            'Failed to cancel pipeline',
+          );
+        }
       }
       break;
 

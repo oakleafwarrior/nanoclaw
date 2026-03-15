@@ -57,7 +57,12 @@ import {
   loadSenderAllowlist,
   shouldDropMessage,
 } from './sender-allowlist.js';
-import { extractSessionCommand, handleSessionCommand, isSessionCommandAllowed } from './session-commands.js';
+import { resolveModel } from './model-router.js';
+import {
+  extractSessionCommand,
+  handleSessionCommand,
+  isSessionCommandAllowed,
+} from './session-commands.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { Channel, NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
@@ -179,23 +184,100 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     timezone: TIMEZONE,
     deps: {
       sendMessage: (text) => channel.sendMessage(chatJid, text),
-      setTyping: (typing) => channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
-      runAgent: (prompt, onOutput) => runAgent(group, prompt, chatJid, onOutput),
+      setTyping: (typing) =>
+        channel.setTyping?.(chatJid, typing) ?? Promise.resolve(),
+      runAgent: (prompt, onOutput) =>
+        runAgent(group, prompt, chatJid, onOutput),
       closeStdin: () => queue.closeStdin(chatJid),
-      advanceCursor: (ts) => { lastAgentTimestamp[chatJid] = ts; saveState(); },
+      advanceCursor: (ts) => {
+        lastAgentTimestamp[chatJid] = ts;
+        saveState();
+      },
       formatMessages,
       canSenderInteract: (msg) => {
         const hasTrigger = TRIGGER_PATTERN.test(msg.content.trim());
         const reqTrigger = !isMainGroup && group.requiresTrigger !== false;
-        return isMainGroup || !reqTrigger || (hasTrigger && (
-          msg.is_from_me ||
-          isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())
-        ));
+        return (
+          isMainGroup ||
+          !reqTrigger ||
+          (hasTrigger &&
+            (msg.is_from_me ||
+              isTriggerAllowed(chatJid, msg.sender, loadSenderAllowlist())))
+        );
       },
     },
   });
   if (cmdResult.handled) return cmdResult.success;
   // --- End session command interception ---
+
+  // Handle /model command: switch model without spinning up the agent
+  const lastMsg = missedMessages[missedMessages.length - 1];
+  const modelCmd = lastMsg?.content
+    .trim()
+    .match(/^\/model\s+(opus|sonnet|haiku|auto)$/i);
+  if (modelCmd && (isMainGroup || lastMsg?.is_from_me)) {
+    const requested = modelCmd[1].toLowerCase();
+
+    if (requested === 'auto') {
+      // Enable auto-routing, unpin model
+      const updated: RegisteredGroup = {
+        ...group,
+        containerConfig: {
+          ...group.containerConfig,
+          autoRoute: true,
+          modelPinned: false,
+        },
+      };
+      setRegisteredGroup(chatJid, updated);
+      registeredGroups[chatJid] = updated;
+      lastAgentTimestamp[chatJid] = lastMsg.timestamp;
+      saveState();
+      await channel.sendMessage(
+        chatJid,
+        'Auto model routing **enabled**. Messages will be routed to opus/sonnet/haiku based on complexity.',
+      );
+      return true;
+    }
+
+    const modelMap: Record<string, string> = {
+      opus: 'claude-opus-4-6',
+      sonnet: 'claude-sonnet-4-6',
+      haiku: 'claude-haiku-4-5-20251001',
+    };
+    const newModel = modelMap[requested];
+    const updated: RegisteredGroup = {
+      ...group,
+      containerConfig: {
+        ...group.containerConfig,
+        model: newModel,
+        modelPinned: true,
+        autoRoute: false,
+      },
+    };
+    setRegisteredGroup(chatJid, updated);
+    registeredGroups[chatJid] = updated;
+    // Remove cached settings.json so the new model is written on next container start
+    const { DATA_DIR } = await import('./config.js');
+    const settingsFile = path.join(
+      DATA_DIR,
+      'sessions',
+      group.folder,
+      '.claude',
+      'settings.json',
+    );
+    try {
+      fs.unlinkSync(settingsFile);
+    } catch {
+      /* ok if missing */
+    }
+    lastAgentTimestamp[chatJid] = lastMsg.timestamp;
+    saveState();
+    await channel.sendMessage(
+      chatJid,
+      `Model pinned to **${newModel}** (auto-routing disabled)`,
+    );
+    return true;
+  }
 
   // For non-main groups, check if trigger is required and present
   if (!isMainGroup && group.requiresTrigger !== false) {
@@ -210,6 +292,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }
   }
 
+  // Auto model routing — pick the right model based on message content
+  const modelResult = resolveModel(group, missedMessages);
+  let effectiveGroup = group;
+  if (modelResult.autoRouted) {
+    effectiveGroup = {
+      ...group,
+      containerConfig: { ...group.containerConfig, model: modelResult.modelId },
+    };
+    await channel.sendMessage(chatJid, `[auto-routed to ${modelResult.tier}]`);
+  }
+
   const prompt = formatMessages(missedMessages, TIMEZONE);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
@@ -220,7 +313,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   saveState();
 
   logger.info(
-    { group: group.name, messageCount: missedMessages.length },
+    { group: effectiveGroup.name, messageCount: missedMessages.length },
     'Processing messages',
   );
 
@@ -231,7 +324,7 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
       logger.debug(
-        { group: group.name },
+        { group: effectiveGroup.name },
         'Idle timeout, closing container stdin',
       );
       queue.closeStdin(chatJid);
@@ -242,32 +335,40 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
-    // Streaming output callback — called for each agent result
-    if (result.result) {
-      const raw =
-        typeof result.result === 'string'
-          ? result.result
-          : JSON.stringify(result.result);
-      // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
-      const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-      logger.info({ group: group.name }, `Agent output: ${raw.slice(0, 200)}`);
-      if (text) {
-        await channel.sendMessage(chatJid, text);
-        outputSentToUser = true;
+  const output = await runAgent(
+    effectiveGroup,
+    prompt,
+    chatJid,
+    async (result) => {
+      // Streaming output callback — called for each agent result
+      if (result.result) {
+        const raw =
+          typeof result.result === 'string'
+            ? result.result
+            : JSON.stringify(result.result);
+        // Strip <internal>...</internal> blocks — agent uses these for internal reasoning
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        logger.info(
+          { group: group.name },
+          `Agent output: ${raw.slice(0, 200)}`,
+        );
+        if (text) {
+          await channel.sendMessage(chatJid, text);
+          outputSentToUser = true;
+        }
+        // Only reset idle timer on actual results, not session-update markers (result: null)
+        resetIdleTimer();
       }
-      // Only reset idle timer on actual results, not session-update markers (result: null)
-      resetIdleTimer();
-    }
 
-    if (result.status === 'success') {
-      queue.notifyIdle(chatJid);
-    }
+      if (result.status === 'success') {
+        queue.notifyIdle(chatJid);
+      }
 
-    if (result.status === 'error') {
-      hadError = true;
-    }
-  });
+      if (result.status === 'error') {
+        hadError = true;
+      }
+    },
+  );
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
@@ -434,7 +535,12 @@ async function startMessageLoop(): Promise<void> {
             // Only close active container if the sender is authorized — otherwise an
             // untrusted user could kill in-flight work by sending /compact (DoS).
             // closeStdin no-ops internally when no container is active.
-            if (isSessionCommandAllowed(isMainGroup, loopCmdMsg.is_from_me === true)) {
+            if (
+              isSessionCommandAllowed(
+                isMainGroup,
+                loopCmdMsg.is_from_me === true,
+              )
+            ) {
               queue.closeStdin(chatJid);
             }
             // Enqueue so processGroupMessages handles auth + cursor advancement.

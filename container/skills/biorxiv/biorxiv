@@ -1,0 +1,135 @@
+#!/bin/bash
+# biorxiv — CLI tool for searching bioRxiv/medRxiv preprints
+# Uses the bioRxiv API (api.biorxiv.org) and EuropePMC for keyword search.
+
+set -euo pipefail
+
+usage() {
+  cat <<'HELP'
+Usage: biorxiv <command> [arguments]
+
+Commands:
+  search <query> [--limit N]       Search preprints by keyword (default: 10 results)
+  details <doi>                    Get full details for a preprint by DOI
+  recent <subject> [--days N]      List recent preprints in a subject (default: 7 days)
+  published <doi>                  Check if a preprint has been published in a journal
+  categories                       List available bioRxiv subject categories
+
+Examples:
+  biorxiv search "hypoxia blood vessel endothelial"
+  biorxiv search "single cell RNA-seq angiogenesis" --limit 20
+  biorxiv details "10.1101/2024.01.15.575123"
+  biorxiv recent "cell-biology" --days 14
+  biorxiv published "10.1101/2024.01.15.575123"
+HELP
+  exit 1
+}
+
+[ $# -lt 1 ] && usage
+
+CMD="$1"; shift
+
+case "$CMD" in
+  search)
+    [ $# -lt 1 ] && { echo "Error: search requires a query string"; exit 1; }
+    QUERY="$1"; shift
+    LIMIT=10
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --limit) LIMIT="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    # Use EuropePMC which indexes bioRxiv/medRxiv preprints
+    ENCODED=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$QUERY'))")
+    URL="https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=(SRC:PPR)%20AND%20${ENCODED}&format=json&pageSize=${LIMIT}&sort=DATE_CREATED%20desc"
+    RESULT=$(curl -sf "$URL" 2>/dev/null) || { echo "Error: search request failed"; exit 1; }
+    echo "$RESULT" | jq -r '
+      .resultList.result[] |
+      "DOI: \(.doi // "N/A")\nTitle: \(.title // "N/A")\nAuthors: \(.authorString // "N/A")\nDate: \(.firstPublicationDate // "N/A")\nSource: \(.bookOrReportDetails.publisher // "bioRxiv/medRxiv")\nAbstract: \(.abstractText // "N/A" | .[0:300])...\n---"
+    ' 2>/dev/null || echo "No results found."
+    ;;
+
+  details)
+    [ $# -lt 1 ] && { echo "Error: details requires a DOI"; exit 1; }
+    DOI="$1"
+    # Try bioRxiv first, then medRxiv
+    for SERVER in biorxiv medrxiv; do
+      RESULT=$(curl -sf "https://api.biorxiv.org/details/${SERVER}/${DOI}" 2>/dev/null)
+      COUNT=$(echo "$RESULT" | jq -r '.messages[0].count // 0' 2>/dev/null)
+      if [ "$COUNT" != "0" ] && [ "$COUNT" != "" ]; then
+        echo "$RESULT" | jq -r '
+          .collection[0] |
+          "DOI: \(.doi)\nTitle: \(.title)\nAuthors: \(.authors)\nDate: \(.date)\nVersion: \(.version)\nCategory: \(.category)\nServer: \(.server)\nPublished: \(.published // "Not yet")\n\nAbstract:\n\(.abstract)"
+        '
+        exit 0
+      fi
+    done
+    echo "Error: preprint not found for DOI: ${DOI}"
+    exit 1
+    ;;
+
+  recent)
+    [ $# -lt 1 ] && { echo "Error: recent requires a subject category"; exit 1; }
+    SUBJECT="$1"; shift
+    DAYS=7
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --days) DAYS="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    END=$(date -u +%Y-%m-%d 2>/dev/null || date +%Y-%m-%d)
+    START=$(date -u -d "-${DAYS} days" +%Y-%m-%d 2>/dev/null || python3 -c "from datetime import datetime,timedelta;print((datetime.now()-timedelta(days=${DAYS})).strftime('%Y-%m-%d'))")
+    RESULT=$(curl -sf "https://api.biorxiv.org/details/biorxiv/${START}/${END}/0" 2>/dev/null) || { echo "Error: API request failed"; exit 1; }
+    echo "$RESULT" | jq -r --arg subj "$SUBJECT" '
+      [.collection[] | select(.category | ascii_downcase | contains($subj | ascii_downcase))] |
+      if length == 0 then "No preprints found for category: \($subj) in the last few days."
+      else .[:20][] |
+        "DOI: \(.doi)\nTitle: \(.title)\nAuthors: \(.authors | split(";")[0:3] | join(";"))...\nDate: \(.date)\nCategory: \(.category)\n---"
+      end
+    ' 2>/dev/null || echo "No results found."
+    ;;
+
+  published)
+    [ $# -lt 1 ] && { echo "Error: published requires a DOI"; exit 1; }
+    DOI="$1"
+    for SERVER in biorxiv medrxiv; do
+      RESULT=$(curl -sf "https://api.biorxiv.org/pubs/${SERVER}/${DOI}" 2>/dev/null)
+      COUNT=$(echo "$RESULT" | jq -r '.messages[0].count // 0' 2>/dev/null)
+      if [ "$COUNT" != "0" ] && [ "$COUNT" != "" ]; then
+        echo "$RESULT" | jq -r '
+          .collection[0] |
+          "Preprint DOI: \(.preprint_doi)\nPublished DOI: \(.published_doi)\nJournal: \(.published_journal)\nDate: \(.published_date)"
+        '
+        exit 0
+      fi
+    done
+    echo "Not yet published (or not found)."
+    ;;
+
+  categories)
+    cat <<'CATS'
+bioRxiv subject categories:
+  animal-behavior-and-cognition    biochemistry
+  bioengineering                   bioinformatics
+  biophysics                       cancer-biology
+  cell-biology                     clinical-trials
+  developmental-biology            ecology
+  epidemiology                     evolutionary-biology
+  genetics                         genomics
+  immunology                       microbiology
+  molecular-biology                neuroscience
+  paleontology                     pathology
+  pharmacology-and-toxicology      physiology
+  plant-biology                    scientific-communication
+  synthetic-biology                systems-biology
+  zoology
+CATS
+    ;;
+
+  *)
+    echo "Unknown command: $CMD"
+    usage
+    ;;
+esac

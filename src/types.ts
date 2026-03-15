@@ -30,6 +30,9 @@ export interface AllowedRoot {
 export interface ContainerConfig {
   additionalMounts?: AdditionalMount[];
   timeout?: number; // Default: 300000 (5 minutes)
+  model?: string; // Model override, e.g. 'claude-opus-4-6' or 'claude-sonnet-4-6'
+  autoRoute?: boolean; // Enable automatic model selection based on message content
+  modelPinned?: boolean; // Set by /model <tier>, disables auto-routing until /model auto
 }
 
 export interface RegisteredGroup {
@@ -66,6 +69,35 @@ export interface ScheduledTask {
   last_result: string | null;
   status: 'active' | 'paused' | 'completed';
   created_at: string;
+  pipeline_id?: string | null;
+  pipeline_step?: number | null;
+}
+
+// --- Pipeline types ---
+
+export interface PipelineStep {
+  name: string;
+  prompt: string;
+  status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped';
+  result: string | null;
+  error: string | null;
+  started_at: string | null;
+  completed_at: string | null;
+  task_id: string | null;
+}
+
+export interface Pipeline {
+  id: string;
+  name: string;
+  group_folder: string;
+  chat_jid: string;
+  status: 'running' | 'paused' | 'completed' | 'failed';
+  current_step: number;
+  context_mode: 'isolated' | 'group';
+  notify: boolean;
+  created_at: string;
+  updated_at: string;
+  steps: PipelineStep[];
 }
 
 export interface TaskRunLog {

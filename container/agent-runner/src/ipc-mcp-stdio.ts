@@ -297,6 +297,175 @@ server.tool(
   },
 );
 
+// --- Pipeline tools ---
+
+const PIPELINES_DIR = '/workspace/group/pipelines';
+
+server.tool(
+  'create_pipeline',
+  `Create a multi-step experimental pipeline. Each step runs as a full agent session with access to all tools. Steps execute sequentially — each step's results are automatically passed as context to the next step.
+
+Use pipelines for multi-session workflows like:
+• Data processing: load → QC → normalize → cluster → analyze
+• Literature review: search → filter → read → synthesize
+• Any workflow where later steps depend on earlier results
+
+Each step should be self-contained enough to run independently, but can reference results from previous steps. Steps should save detailed results to files in the workspace and provide a brief summary in their output.
+
+CONTEXT MODE:
+• "isolated" (default): Each step runs in a fresh session. Best for pipelines where steps are independent units of work.
+• "group": Each step runs in the group's conversation context. Best when steps need access to chat history.`,
+  {
+    name: z.string().describe('Pipeline name (e.g., "Hypoxia DE Analysis", "Literature Review")'),
+    steps: z.array(z.object({
+      name: z.string().describe('Step name (e.g., "Load and QC", "Normalize")'),
+      prompt: z.string().describe('What the agent should do in this step'),
+    })).min(1).describe('Ordered list of steps to execute'),
+    context_mode: z.enum(['isolated', 'group']).default('isolated').describe('Session context for each step'),
+    notify: z.boolean().default(true).describe('Send progress messages to chat after each step'),
+    target_group_jid: z.string().optional().describe('(Main group only) JID of the group to run the pipeline in'),
+  },
+  async (args) => {
+    const targetJid = isMain && args.target_group_jid ? args.target_group_jid : chatJid;
+
+    const data = {
+      type: 'create_pipeline',
+      name: args.name,
+      steps: args.steps,
+      context_mode: args.context_mode || 'isolated',
+      notify: args.notify !== false,
+      targetJid,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(TASKS_DIR, data);
+
+    const stepList = args.steps.map((s, i) => `  ${i + 1}. ${s.name}`).join('\n');
+    return {
+      content: [{ type: 'text' as const, text: `Pipeline "${args.name}" created with ${args.steps.length} steps:\n${stepList}\n\nFirst step will begin shortly.` }],
+    };
+  },
+);
+
+server.tool(
+  'list_pipelines',
+  'List all pipelines for the current group. Reads directly from workspace.',
+  {},
+  async () => {
+    try {
+      if (!fs.existsSync(PIPELINES_DIR)) {
+        return { content: [{ type: 'text' as const, text: 'No pipelines found.' }] };
+      }
+
+      const files = fs.readdirSync(PIPELINES_DIR).filter(f => f.endsWith('.json'));
+      if (files.length === 0) {
+        return { content: [{ type: 'text' as const, text: 'No pipelines found.' }] };
+      }
+
+      const pipelines = files.map(f => {
+        try {
+          return JSON.parse(fs.readFileSync(path.join(PIPELINES_DIR, f), 'utf-8'));
+        } catch {
+          return null;
+        }
+      }).filter(Boolean);
+
+      const formatted = pipelines.map((p: { id: string; name: string; status: string; current_step: number; steps: { name: string; status: string }[] }) => {
+        const progress = p.steps.filter((s: { status: string }) => s.status === 'completed').length;
+        return `- [${p.id}] "${p.name}" — ${p.status} (${progress}/${p.steps.length} steps)`;
+      }).join('\n');
+
+      return { content: [{ type: 'text' as const, text: `Pipelines:\n${formatted}` }] };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error listing pipelines: ${err instanceof Error ? err.message : String(err)}` }],
+      };
+    }
+  },
+);
+
+server.tool(
+  'get_pipeline',
+  'Get full details of a specific pipeline including all step statuses and results.',
+  { pipeline_id: z.string().describe('The pipeline ID') },
+  async (args) => {
+    try {
+      const filePath = path.join(PIPELINES_DIR, `${args.pipeline_id}.json`);
+      if (!fs.existsSync(filePath)) {
+        return {
+          content: [{ type: 'text' as const, text: `Pipeline ${args.pipeline_id} not found.` }],
+          isError: true,
+        };
+      }
+
+      const pipeline = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
+      const steps = pipeline.steps.map((s: { name: string; status: string; result: string | null; error: string | null }, i: number) => {
+        let line = `  ${i + 1}. [${s.status}] ${s.name}`;
+        if (s.result) line += `\n     Result: ${s.result.slice(0, 200)}`;
+        if (s.error) line += `\n     Error: ${s.error}`;
+        return line;
+      }).join('\n');
+
+      return {
+        content: [{ type: 'text' as const, text: `Pipeline: ${pipeline.name} (${pipeline.id})\nStatus: ${pipeline.status}\nCreated: ${pipeline.created_at}\n\nSteps:\n${steps}` }],
+      };
+    } catch (err) {
+      return {
+        content: [{ type: 'text' as const, text: `Error reading pipeline: ${err instanceof Error ? err.message : String(err)}` }],
+      };
+    }
+  },
+);
+
+server.tool(
+  'pause_pipeline',
+  'Pause a running pipeline. The current step will finish, but no further steps will start. Use resume_pipeline to continue.',
+  { pipeline_id: z.string().describe('The pipeline ID to pause') },
+  async (args) => {
+    const data = {
+      type: 'pause_pipeline',
+      pipelineId: args.pipeline_id,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(TASKS_DIR, data);
+    return { content: [{ type: 'text' as const, text: `Pipeline ${args.pipeline_id} pause requested.` }] };
+  },
+);
+
+server.tool(
+  'resume_pipeline',
+  'Resume a paused pipeline from where it left off.',
+  { pipeline_id: z.string().describe('The pipeline ID to resume') },
+  async (args) => {
+    const data = {
+      type: 'resume_pipeline',
+      pipelineId: args.pipeline_id,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(TASKS_DIR, data);
+    return { content: [{ type: 'text' as const, text: `Pipeline ${args.pipeline_id} resume requested.` }] };
+  },
+);
+
+server.tool(
+  'cancel_pipeline',
+  'Cancel a pipeline. The current step will finish, but remaining steps are skipped.',
+  { pipeline_id: z.string().describe('The pipeline ID to cancel') },
+  async (args) => {
+    const data = {
+      type: 'cancel_pipeline',
+      pipelineId: args.pipeline_id,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+    writeIpcFile(TASKS_DIR, data);
+    return { content: [{ type: 'text' as const, text: `Pipeline ${args.pipeline_id} cancellation requested.` }] };
+  },
+);
+
 server.tool(
   'register_group',
   `Register a new chat/group so the agent can respond to messages there. Main group only.

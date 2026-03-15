@@ -19,6 +19,7 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { resolveGroupFolderPath } from './group-folder.js';
 import { logger } from './logger.js';
+import { advancePipeline } from './pipelines.js';
 import { RegisteredGroup, ScheduledTask } from './types.js';
 
 /**
@@ -236,6 +237,27 @@ async function runTask(
       ? result.slice(0, 200)
       : 'Completed';
   updateTaskAfterRun(task.id, nextRun, resultSummary);
+
+  // Advance pipeline if this task is a pipeline step
+  if (task.pipeline_id && task.pipeline_step != null) {
+    try {
+      const notification = advancePipeline(
+        task.pipeline_id,
+        task.group_folder,
+        task.pipeline_step,
+        result,
+        error,
+      );
+      if (notification) {
+        await deps.sendMessage(task.chat_jid, notification);
+      }
+    } catch (err) {
+      logger.error(
+        { taskId: task.id, pipelineId: task.pipeline_id, err },
+        'Error advancing pipeline',
+      );
+    }
+  }
 }
 
 let schedulerRunning = false;
